@@ -603,6 +603,304 @@ def _build_deepseek_v4_metadata(forward_batch: ForwardBatch, positions: torch.Te
     return attn_metadata
 
 
+def _build_dspark_draft_capture_metadata(
+    forward_batch, positions, proxy_pool, state, is_decode, num_reqs, device
+):
+    """Copy-free DSpark draft metadata for CUDA-graph capture/replay.
+
+    Builds every tensor on-device (arange / cast / repeat_interleave — all
+    graph-capturable kernels that re-execute on replay) and references the
+    persistent ``req_pool_indices`` buffer for ``state_slot_out``, so the graph
+    replays against live per-step values with NO host<->device copy. The draft's
+    dspark_attention reads only ``state_slot_out`` here; the inject path (which
+    reads the rest) runs outside the graph, so those fields stay empty/None.
+    """
+    from collections import defaultdict
+
+    from atom.utils.forward_context import AttentionMetaData
+
+    if is_decode:
+        lens_val = 1
+    else:
+        tpr = getattr(
+            getattr(forward_batch, "spec_info", None), "num_tokens_per_req", None
+        )
+        lens_val = max(1, int(tpr) if tpr is not None else 1)
+
+    rpi = forward_batch.req_pool_indices[:num_reqs].to(dtype=torch.int32)
+    ar = torch.arange(num_reqs + 1, device=device, dtype=torch.int32)
+    cu_q = ar * lens_val
+    batch_id = torch.arange(num_reqs, device=device, dtype=torch.int32)
+    if lens_val > 1:
+        batch_id = batch_id.repeat_interleave(lens_val)
+
+    md = AttentionMetaData(
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_q,
+        max_seqlen_q=lens_val,
+        max_seqlen_k=1,
+        slot_mapping=getattr(forward_batch, "out_cache_loc", None),
+        context_lens=getattr(forward_batch, "seq_lens", None),
+        block_tables=None,
+        state=state,
+    )
+    md.state_slot_in = md.state_slot_out = md.state_slot_mapping = rpi
+    md.state_slot_mapping_cpu = None
+    md.reset_slots = set()
+    md.batch_id_per_token = batch_id
+    md.batch_id_per_token_cpu = None
+    md.n_committed_csa_per_seq_cpu = None
+    md.n_committed_hca_per_seq_cpu = None
+    md.n_committed_csa_per_seq = None
+    md.n_committed_hca_per_seq = None
+    md.compress_plans = defaultdict(lambda: None)
+    empty = torch.empty(0, dtype=torch.int32, device=device)
+    zero = torch.zeros(1, dtype=torch.int32, device=device)
+    md.kv_indices_extend = md.kv_indices_prefix_swa = empty
+    md.kv_indices_prefix_csa = md.kv_indices_prefix_hca = empty
+    md.kv_indptr_extend = md.kv_indptr_prefix_swa = zero
+    md.kv_indptr_prefix_csa = md.kv_indptr_prefix_hca = zero
+    md.skip_prefix_len_csa = empty
+    if proxy_pool is not None:
+        from atom.plugin.sglang.deepseek_v4_bridge import _resolve_v4_index_topk
+
+        md.swa_num_slots = proxy_pool.num_slots
+        md.swa_window = proxy_pool.window_size
+        md.swa_cs = proxy_pool.swa_cache_size
+        md.index_topk = _resolve_v4_index_topk(proxy_pool=proxy_pool)
+        md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
+        md.pool_geometry = proxy_pool.pool_geometry
+        md.envelope_rows = proxy_pool.pool_geometry.envelope_rows
+    md.swa_dest_rows = None
+    return md
+
+
+def _build_deepseek_v4_dspark_draft_metadata(
+    forward_batch: ForwardBatch, positions: torch.Tensor
+):
+    """Build ATOM metadata for the DeepSeek-V4 DSpark draft model in SGLang plugin mode.
+
+    The DSpark draft model (arch: DeepseekV4DSparkModel) runs 3 target SWA layers.
+    Its proxy pool has DENSE-only geometry (no CSA/HCA), so
+    build_atom_v4_attention_metadata_from_sglang fails at the pool-geometry
+    assertion inside _populate_prefill_indices. This builder computes only the
+    SWA-specific indices needed by the DSpark layers without requiring CSA/HCA.
+    """
+    import numpy as np
+
+    from atom.utils.forward_context import AttentionMetaData, AttnState
+
+    device = positions.device
+    num_reqs = int(forward_batch.batch_size)
+    from atom.plugin.sglang.deepseek_v4_bridge import (
+        _build_block_tables,
+        _get_extend_lens_cpu,
+        _get_seq_lens_cpu,
+        _infer_atom_attn_state,
+        maybe_get_proxy_pool_from_sglang_backend,
+    )
+    from atom.plugin.sglang.runtime.context import is_draft_extend_mode
+
+    proxy_pool, req_to_token_pool = maybe_get_proxy_pool_from_sglang_backend()
+    is_decode = forward_batch.forward_mode.is_decode_or_idle()
+    is_draft_extend_fwd = is_draft_extend_mode(
+        forward_batch.forward_mode, include_v2=True
+    )
+    state = _infer_atom_attn_state(forward_batch)
+
+    # ---- CUDA-graph-capture-safe path -----------------------------------------
+    # Inside a capturing stream, host<->device copies are forbidden. The DSpark
+    # draft forward (dspark_attention) reads ONLY `state_slot_out` from this
+    # metadata plus `positions`; everything else (cu_seqlens_q, batch_id,
+    # n_committed, block_tables, kv_indices) serves the inject/prefill path, which
+    # runs OUTSIDE the graph. So build a copy-free metadata that references the
+    # persistent graph buffers (`req_pool_indices`, updated before each replay)
+    # and constructs the constant per-bs fields on-device (no numpy H2D).
+    if _is_current_stream_capturing():
+        return _build_dspark_draft_capture_metadata(
+            forward_batch, positions, proxy_pool, state, is_decode, num_reqs, device
+        )
+
+    seq_np = _get_seq_lens_cpu(forward_batch)[:num_reqs]
+
+    if is_decode:
+        lens = np.ones(num_reqs, dtype=np.int32)
+    elif is_draft_extend_fwd:
+        tokens_per_req = getattr(
+            getattr(forward_batch, "spec_info", None), "num_tokens_per_req", None
+        )
+        if tokens_per_req is None:
+            tokens_per_req = max(1, int(positions.numel()) // max(1, num_reqs))
+        lens = np.full(num_reqs, int(tokens_per_req), dtype=np.int32)
+    else:
+        extend_lens = _get_extend_lens_cpu(forward_batch, positions)
+        if extend_lens is None:
+            tokens_per_req = max(1, int(positions.numel()) // max(1, num_reqs))
+            lens = np.full(num_reqs, tokens_per_req, dtype=np.int32)
+        else:
+            lens = np.asarray(extend_lens, dtype=np.int32)[:num_reqs]
+
+    q_np = np.zeros(num_reqs + 1, dtype=np.int32)
+    q_np[1:] = np.cumsum(lens, dtype=np.int32)
+    cu_q = torch.from_numpy(q_np).to(device=device, dtype=torch.int32)
+    batch_np = np.repeat(np.arange(num_reqs, dtype=np.int32), lens)
+
+    max_seq_len = int(seq_np.max()) if len(seq_np) else 1
+    from atom.plugin.sglang.deepseek_v4_bridge import ATOM_DEEPSEEK_V4_BLOCK_SIZE
+    block_tables = (
+        _build_block_tables(
+            req_to_token_pool,
+            forward_batch.req_pool_indices[:num_reqs],
+            max_seq_len,
+            ATOM_DEEPSEEK_V4_BLOCK_SIZE,
+        )
+        if req_to_token_pool is not None and getattr(forward_batch, "req_pool_indices", None) is not None
+        else None
+    )
+
+    req_pool_indices = getattr(forward_batch, "req_pool_indices", None)
+    if req_pool_indices is not None:
+        state_slot = req_pool_indices[:num_reqs].to(device=device, dtype=torch.int32)
+    else:
+        state_slot = torch.arange(num_reqs, device=device, dtype=torch.int32)
+
+    md = AttentionMetaData(
+        cu_seqlens_q=cu_q,
+        cu_seqlens_k=cu_q,
+        max_seqlen_q=int(lens.max()) if len(lens) else 1,
+        max_seqlen_k=max_seq_len,
+        slot_mapping=getattr(forward_batch, "out_cache_loc", None),
+        context_lens=getattr(forward_batch, "seq_lens", None),
+        block_tables=block_tables,
+        state=state,
+    )
+    md.state_slot_in = state_slot
+    md.state_slot_out = state_slot
+    md.state_slot_mapping = state_slot
+    md.state_slot_mapping_cpu = state_slot.cpu().numpy() if req_pool_indices is not None else np.arange(num_reqs, dtype=np.int32)
+    md.reset_slots = set()
+    md.batch_id_per_token = torch.from_numpy(batch_np).to(device=device)
+    md.batch_id_per_token_cpu = batch_np
+    md.n_committed_csa_per_seq_cpu = (seq_np // 4).astype(np.int32)
+    md.n_committed_hca_per_seq_cpu = (seq_np // 128).astype(np.int32)
+    md.n_committed_csa_per_seq = torch.from_numpy(md.n_committed_csa_per_seq_cpu).to(device=device)
+    md.n_committed_hca_per_seq = torch.from_numpy(md.n_committed_hca_per_seq_cpu).to(device=device)
+    # DSpark draft layers (SWA/DENSE ratio=0) need compress_plans[ratio].
+    # Provide a no-op mapping: compress_plans[0] = None skips compression.
+    from collections import defaultdict
+    md.compress_plans = defaultdict(lambda: None)
+    # DSpark draft SWA layers read kv_indices_prefix_swa / kv_indptr_prefix_swa.
+    # Compute SWA-only prefill indices for the proxy pool's DENSE window.
+    if not is_decode and block_tables is not None and proxy_pool is not None:
+        _populate_dspark_swa_prefill_indices(
+            md, block_tables, batch_np,
+            positions[:int(lens.sum())].detach().cpu().numpy().astype(np.int32),
+            q_np, device, proxy_pool,
+        )
+    else:
+        empty = torch.empty(0, dtype=torch.int32, device=device)
+        zero = torch.zeros(1, dtype=torch.int32, device=device)
+        md.kv_indices_extend = md.kv_indices_prefix_swa = empty
+        md.kv_indices_prefix_csa = md.kv_indices_prefix_hca = empty
+        md.kv_indptr_extend = md.kv_indptr_prefix_swa = zero
+        md.kv_indptr_prefix_csa = md.kv_indptr_prefix_hca = zero
+        md.skip_prefix_len_csa = empty
+    if proxy_pool is not None:
+        from atom.plugin.sglang.deepseek_v4_bridge import _resolve_v4_index_topk
+        md.swa_num_slots = proxy_pool.num_slots
+        md.swa_window = proxy_pool.window_size
+        md.swa_cs = proxy_pool.swa_cache_size
+        md.index_topk = _resolve_v4_index_topk(proxy_pool=proxy_pool)
+        md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
+        md.pool_geometry = proxy_pool.pool_geometry
+        md.envelope_rows = proxy_pool.pool_geometry.envelope_rows
+    md.swa_dest_rows = None
+    return md
+
+
+def _populate_dspark_swa_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device, proxy_pool):
+    """Compute SWA-only paged prefill index arrays for DSpark draft layers.
+
+    Avoids the write_v4_paged_prefill_indices assertion that requires CSA+HCA
+    geometry. Computes extend and SWA-prefix indices manually for DENSE-only pools.
+    """
+    import numpy as np
+
+    T = len(batch_np)
+    if T == 0:
+        empty = torch.empty(0, dtype=torch.int32, device=device)
+        zero = torch.zeros(1, dtype=torch.int32, device=device)
+        md.kv_indices_extend = md.kv_indices_prefix_swa = empty
+        md.kv_indices_prefix_csa = md.kv_indices_prefix_hca = empty
+        md.kv_indptr_extend = md.kv_indptr_prefix_swa = zero
+        md.kv_indptr_prefix_csa = md.kv_indptr_prefix_hca = zero
+        md.skip_prefix_len_csa = empty
+        return
+
+    win = int(getattr(proxy_pool, "window_size", 4096))
+    chunk_start_per_seq = pos_np[q_np[:-1]]
+    chunk_start_pt = chunk_start_per_seq[batch_np]
+    token_pos_in_chunk = pos_np - chunk_start_pt
+    swa_low = np.maximum(pos_np - win + 1, 0)
+    extend_count = np.minimum(token_pos_in_chunk + 1, win).astype(np.int32)
+    prefix_swa_count = np.maximum(chunk_start_pt - swa_low, 0).astype(np.int32)
+
+    def _counts_to_indptr(counts):
+        result = np.zeros(len(counts) + 1, dtype=np.int32)
+        result[1:] = np.cumsum(counts)
+        return result
+
+    ext_indptr_np = _counts_to_indptr(extend_count)
+    swa_indptr_np = _counts_to_indptr(prefix_swa_count)
+
+    def t(arr):
+        return torch.from_numpy(np.ascontiguousarray(arr)).to(device=device, dtype=torch.int32)
+
+    ext_indices = torch.empty(max(1, int(ext_indptr_np[-1])), dtype=torch.int32, device=device)
+    swa_indices = torch.empty(max(1, int(swa_indptr_np[-1])), dtype=torch.int32, device=device)
+    # For CSA/HCA: empty (DSpark draft doesn't use them)
+    empty = torch.empty(0, dtype=torch.int32, device=device)
+    zero_ptr = torch.zeros(T + 1, dtype=torch.int32, device=device)
+
+    # Attempt to use the kernel for SWA-only — if the pool has DENSE, use it.
+    # Otherwise set all indices to empty tensors (no attention to prior context).
+    try:
+        from atom.model_ops.v4_kernels import write_v4_paged_prefill_indices
+        write_v4_paged_prefill_indices(
+            positions=t(pos_np),
+            bid_per_token=t(batch_np),
+            chunk_start_per_seq=t(chunk_start_per_seq),
+            cu_seqlens_q_per_seq=t(q_np),
+            state_slot_per_seq=md.state_slot_mapping,
+            n_committed_hca_per_seq=md.n_committed_hca_per_seq,
+            block_tables=block_tables,
+            extend_indptr=t(ext_indptr_np),
+            prefix_swa_indptr=t(swa_indptr_np),
+            prefix_csa_indptr=torch.zeros(T + 1, dtype=torch.int32, device=device),
+            prefix_hca_indptr=torch.zeros(T + 1, dtype=torch.int32, device=device),
+            extend_indices=ext_indices,
+            prefix_swa_indices=swa_indices,
+            prefix_csa_indices=empty,
+            prefix_hca_indices=empty,
+            T=T,
+            win=win,
+            geometry=proxy_pool.pool_geometry,
+        )
+    except (AssertionError, Exception):
+        # Pool geometry doesn't support the kernel — set empty indices
+        ext_indices = empty
+        swa_indices = empty
+
+    md.kv_indices_extend = ext_indices[:int(ext_indptr_np[-1])]
+    md.kv_indptr_extend = t(ext_indptr_np)
+    md.kv_indices_prefix_swa = swa_indices[:int(swa_indptr_np[-1])]
+    md.kv_indptr_prefix_swa = t(swa_indptr_np)
+    # Empty CSA/HCA — DSpark draft doesn't use them
+    md.kv_indices_prefix_csa = md.kv_indices_prefix_hca = empty
+    md.kv_indptr_prefix_csa = md.kv_indptr_prefix_hca = torch.zeros(T + 1, dtype=torch.int32, device=device)
+    md.skip_prefix_len_csa = torch.zeros(T, dtype=torch.int32, device=device)
+
+
 def _build_eagle3_llama_metadata(
     atom_config: Any, forward_batch: ForwardBatch, positions: torch.Tensor
 ):

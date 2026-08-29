@@ -1037,7 +1037,14 @@ def register_ops_to_sglang(atom_config: Config) -> None:
 
     _register_custom_attention_to_sglang()
     _patch_sglang_dsv4_draft_backends()
-    patch_sglang_eagle3_runtime_compat()
+    # Only install EAGLE3 lifecycle patches when EAGLE3 is actually in use.
+    # Patching pool_indexed_future_store unconditionally causes a hang in
+    # SPEC=none mode when the scheduler calls it with a non-speculative payload.
+    _maybe_patch_eagle3 = getattr(
+        getattr(atom_config, "speculative_config", None), "method", None
+    ) == "eagle3"
+    if _maybe_patch_eagle3:
+        patch_sglang_eagle3_runtime_compat()
     _patch_sglang_dsv4_spec_cuda_graph()
     _patch_sglang_eagle_v2_draft_argmax()
 

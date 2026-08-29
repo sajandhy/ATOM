@@ -261,6 +261,9 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         # count for the unified tails.
         self.num_blocks = max(1, self.c128_size)
 
+        # Geometry is the source of truth for both allocation and every index
+        # kernel; build it before carving so the unified-plane sizing matches.
+        self._pool_geometry = None
         total_bytes = self._compute_raw_bytes()
         self.raw_arena = torch.empty(total_bytes, dtype=torch.uint8, device=device)
         # SGLang's /get_internal_state path reports
@@ -271,39 +274,66 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         self.views = self._slice_views()
         self.is_atom_v4_proxy_pool = True
 
-    def _compute_raw_bytes(self) -> int:
-        total = 0
-        if self.use_fp8_kv:
-            swa_bytes = (
-                self.num_slots
-                * self.swa_cache_size
-                * (ATOM_DEEPSEEK_V4_FP8_PACKED_DIM + self.qk_rope_head_dim * 2)
+        import os as _os
+        if _os.environ.get("ATOM_V4_DUMP_GEOM"):
+            g = self.pool_geometry
+            print(f"[V4-GEOM] stage_ratios={self.stage_ratios} num_slots={self.num_slots} "
+                  f"num_blocks={self.num_blocks} swa_cache_size={self.swa_cache_size} "
+                  f"envelope_rows={g.envelope_rows} slot_rows={g.slot_rows} "
+                  f"plane_rows={g.plane_rows} use_fp8_kv={self.use_fp8_kv} "
+                  f"head_dim={self.head_dim} packed_dim={ATOM_DEEPSEEK_V4_FP8_PACKED_DIM} "
+                  f"rope_dim={self.qk_rope_head_dim}", flush=True)
+            for _i, _r in enumerate(self.stage_ratios):
+                _u = self.views["unified"][_i]
+                try:
+                    _wp = g.window_params(_r)
+                    _base = g.layer_base_row(_i)
+                    print(f"[V4-GEOM]  layer={_i} ratio={_r} unified_shape={tuple(_u.shape)} "
+                          f"layer_base_row={_base} wp(ring_start={_wp.ring_start},"
+                          f"slot_rows={getattr(_wp,'slot_rows','?')},ring_slots={_wp.ring_slots},"
+                          f"ring_stride={_wp.ring_stride},run_rows={_wp.run_rows})", flush=True)
+                except Exception as _e:
+                    print(f"[V4-GEOM]  layer={_i} ratio={_r} unified_shape={tuple(_u.shape)} err={_e}", flush=True)
+
+    @property
+    def pool_geometry(self):
+        if self._pool_geometry is None:
+            from atom.model_ops.attentions.v4_pool_geometry import UnifiedPoolGeometry
+
+            self._pool_geometry = UnifiedPoolGeometry(
+                ratios=self.stage_ratios,
+                num_blocks=self.num_blocks,
+                num_slots=self.num_slots,
+                ring_slots=self.swa_cache_size,
+                block_size=ATOM_DEEPSEEK_V4_BLOCK_SIZE,
             )
-        else:
-            swa_bytes = self.num_slots * self.swa_cache_size * self.head_dim * 2
+        return self._pool_geometry
+
+    def _compute_raw_bytes(self) -> int:
+        if self.use_fp8_kv:
+            # Unified-plane (Option A): one shared NoPE plane + one RoPE plane of
+            # `plane_rows` rows, matching UnifiedPoolGeometry — the layout every
+            # index kernel (compress_row / window_row) already addresses. The
+            # CSA indexer stays a standalone per-CSA allocation after the planes.
+            geo = self.pool_geometry
+            plane_rows = geo.plane_rows
+            nope = plane_rows * ATOM_DEEPSEEK_V4_FP8_PACKED_DIM  # fp8, 1 byte/elem
+            rope = plane_rows * self.qk_rope_head_dim * 2        # bf16, 2 bytes
+            n_csa = sum(1 for r in self.stage_ratios if r == 4)
+            rpb_csa = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4
+            idx = n_csa * self.num_blocks * rpb_csa * self.index_dim  # fp8
+            return max(1, nope + rope + idx)
+        total = 0
+        swa_bytes = self.num_slots * self.swa_cache_size * self.head_dim * 2
         for ratio in self.stage_ratios:
             total += swa_bytes
             if ratio == 4:
                 k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 4
-                if self.use_fp8_kv:
-                    total += (
-                        self.num_blocks
-                        * k
-                        * (ATOM_DEEPSEEK_V4_FP8_PACKED_DIM + self.qk_rope_head_dim * 2)
-                    )
-                else:
-                    total += self.num_blocks * k * self.head_dim * 2
+                total += self.num_blocks * k * self.head_dim * 2
                 total += self.num_blocks * k * self.index_dim
             elif ratio == 128:
                 k = ATOM_DEEPSEEK_V4_BLOCK_SIZE // 128
-                if self.use_fp8_kv:
-                    total += (
-                        self.num_blocks
-                        * k
-                        * (ATOM_DEEPSEEK_V4_FP8_PACKED_DIM + self.qk_rope_head_dim * 2)
-                    )
-                else:
-                    total += self.num_blocks * k * self.head_dim * 2
+                total += self.num_blocks * k * self.head_dim * 2
         return max(1, total)
 
     def _take(self, offset: int, nbytes: int) -> torch.Tensor:
@@ -321,6 +351,9 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
             fp8_dtype = dtypes.fp8
         except Exception:  # noqa: BLE001 - fp8 dtype fallback for older aiter
             fp8_dtype = torch.float8_e4m3fnuz
+
+        if self.use_fp8_kv:
+            return self._slice_views_fp8_unified(fp8_dtype)
 
         offset = 0
         unified: list[torch.Tensor] = []
@@ -533,6 +566,99 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
             "hca_main_rope": hca_main_rope,
         }
 
+    def _slice_views_fp8_unified(
+        self, fp8_dtype
+    ) -> dict[str, list[torch.Tensor]]:
+        """Carve one shared NoPE + RoPE plane per ``UnifiedPoolGeometry`` (Option A).
+
+        Native ATOM (`deepseek_v4_attn.allocate_per_req_cache`) and every V4 index
+        kernel (`compress_row`/`window_row`) address ONE block-major plane:
+        compressed block ``b`` occupies rows ``[b*envelope_rows, (b+1)*envelope_rows)``
+        with each layer at its ``layer_base_row`` offset inside the envelope, and a
+        request's windows numbered from the plane end. The previous per-class,
+        SWA-first carve here disagreed with that arithmetic, so long chunked-prefill
+        CSA/HCA prefix indices (``block*envelope_rows``) overran the small per-class
+        buffers and faulted the GPU. Mirroring native's layout makes allocation and
+        every index formula share one arithmetic.
+        """
+        geo = self.pool_geometry
+        packed = ATOM_DEEPSEEK_V4_FP8_PACKED_DIM
+        rope_dim = self.qk_rope_head_dim
+        plane_rows = geo.plane_rows
+        env = geo.envelope_rows
+
+        off = 0
+        nope_bytes = plane_rows * packed  # fp8 = 1 byte/elem
+        nope_plane = (
+            self._take(off, nope_bytes).view(fp8_dtype).view(plane_rows, packed)
+        )
+        off += nope_bytes
+        rope_bytes = plane_rows * rope_dim * 2  # bf16
+        rope_plane = (
+            self._take(off, rope_bytes).view(torch.bfloat16).view(plane_rows, rope_dim)
+        )
+        off += rope_bytes
+
+        unified: list[torch.Tensor] = []
+        unified_rope: list[torch.Tensor | None] = []
+        swa: list[torch.Tensor] = []
+        swa_rope: list[torch.Tensor | None] = []
+        csa_main: list[torch.Tensor] = []
+        csa_main_rope: list[torch.Tensor | None] = []
+        csa_indexer: list[torch.Tensor] = []
+        hca_main: list[torch.Tensor] = []
+        hca_main_rope: list[torch.Tensor | None] = []
+
+        for i, ratio in enumerate(self.stage_ratios):
+            base = int(geo.layer_base_row(i))
+            # A layer's view runs from its envelope base to the plane end; views
+            # OVERLAP so `layer_base_row` cancels the layer term out of both
+            # compress_row and window_row (matches native `_layer_views`).
+            u = nope_plane[base:]
+            ur = rope_plane[base:]
+            unified.append(u)
+            unified_rope.append(ur)
+            swa.append(u)
+            swa_rope.append(ur)
+            if ratio in (4, 128):
+                rpb = ATOM_DEEPSEEK_V4_BLOCK_SIZE // ratio
+                # Block-major compress view: block b at row b*envelope_rows,
+                # rpb rows per block, relative to this layer's base.
+                main = u.as_strided(
+                    (self.num_blocks, rpb, packed),
+                    (env * packed, packed, 1),
+                )
+                main_rope = ur.as_strided(
+                    (self.num_blocks, rpb, rope_dim),
+                    (env * rope_dim, rope_dim, 1),
+                )
+                if ratio == 4:
+                    idx_bytes = self.num_blocks * rpb * self.index_dim
+                    idx = (
+                        self._take(off, idx_bytes)
+                        .view(fp8_dtype)
+                        .view(self.num_blocks, rpb, self.index_dim)
+                    )
+                    off += idx_bytes
+                    csa_main.append(main)
+                    csa_main_rope.append(main_rope)
+                    csa_indexer.append(idx)
+                else:
+                    hca_main.append(main)
+                    hca_main_rope.append(main_rope)
+
+        return {
+            "unified": unified,
+            "unified_rope": unified_rope,
+            "swa": swa,
+            "swa_rope": swa_rope,
+            "csa_main": csa_main,
+            "csa_main_rope": csa_main_rope,
+            "csa_indexer": csa_indexer,
+            "hca_main": hca_main,
+            "hca_main_rope": hca_main_rope,
+        }
+
     def register_mapping(self, full_to_swa_index_mapping: torch.Tensor) -> None:
         self.full_to_swa_index_mapping = full_to_swa_index_mapping
 
@@ -609,6 +735,19 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         # ATOM writes the proxy arena through its own bridge metadata.
         pass
 
+    def set_swa_key_buffer_radix_fused_norm_rope(self, *args, **kwargs) -> None:
+        # Sentinel: presence of this method tells SGLang's TargetHiddenKvInjector
+        # to use the _inject_mla branch, which calls the draft model's
+        # write_target_hidden_kv(main_hidden, swa_loc, positions, pool) instead
+        # of write_target_hidden_kv(target_hidden, pool, positions, cache_loc).
+        # ATOM's DSpark wrapper overrides write_target_hidden_kv to handle the
+        # _inject_mla signature; this pool method itself is never called.
+        raise NotImplementedError(
+            "ATOM V4 proxy pool: set_swa_key_buffer_radix_fused_norm_rope is "
+            "a routing sentinel and must not be called directly. "
+            "The DSpark draft wrapper's write_target_hidden_kv handles injection."
+        )
+
     def get_state_buf_infos(self):
         return ([], [], [])
 
@@ -674,7 +813,7 @@ def install_deepseek_v4_proxy_pool_patch() -> None:
     dsv4_pool.DeepSeekV4TokenToKVPool = ATOMDeepSeekV4ProxyKVPool
     dsv4_pool.ATOMDeepSeekV4ProxyKVPool = ATOMDeepSeekV4ProxyKVPool
 
-    # SGLang 0.5.17 moved pool construction into mem_cache.kv_cache_configurator,
+    # SGLang 0.5.18 moved pool construction into mem_cache.kv_cache_configurator,
     # which imports DeepSeekV4TokenToKVPool as a module-local symbol. Patch any
     # already-loaded local aliases that still point at the original class.
     for module in list(sys.modules.values()):
@@ -770,12 +909,19 @@ def bind_deepseek_v4_proxy_cache_views(model, proxy_pool: Any) -> bool:
         # already had; it is exposed flat because the kernels index rows.
         swa_view = proxy_pool.views["swa"][local_layer_id]
         attn.swa_kv = swa_view.reshape(-1, swa_view.shape[-1])
+        # swa_plane / swa_plane_rope: the piecewise _attn_core for prefill uses
+        # these names (same tensor as swa_kv/swa_kv_rope, different attribute).
+        attn.swa_plane = attn.unified_kv
         swa_rope_view = proxy_pool.views["swa_rope"][local_layer_id]
         attn.swa_kv_rope = (
             swa_rope_view.reshape(-1, swa_rope_view.shape[-1])
             if swa_rope_view is not None
             else None
         )
+        attn.swa_plane_rope = attn.unified_kv_rope
+        # swa_window: per-layer WindowParams from pool geometry (used by swa_write
+        # in the piecewise prefill path and by decode SWA index computation).
+        attn.swa_window = proxy_pool.pool_geometry.window_params(ratio)
         attn.swa_cache_size = proxy_pool.swa_cache_size
         if ratio == 4:
             indexer_topk = int(attn.indexer.index_topk)
@@ -1015,6 +1161,9 @@ class _V4SGLangDecodeGraphBuffers:
         self.idx_swa = i32(t * max(1, win))
         self.idx_csa = i32(t * max(1, win + topk))
         self.idx_hca = i32(t * max(1, win + hca))
+        # Per-token SWA row destination buffers for write_v4_paged_decode_indices.
+        # One per compress class (dense=0, csa=4, hca=128).
+        self.swa_dest_rows = {ratio: i32(t) for ratio in (0, 4, 128)}
 
         # Decode CG plan slicing is `running_bs * per_seq_bound` (computed inside
         # make_compress_plans). running_bs == num_slots (padded decode batch);
@@ -1421,6 +1570,8 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.swa_cs = proxy_pool.swa_cache_size
     md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
+    md.pool_geometry = proxy_pool.pool_geometry
+    md.envelope_rows = proxy_pool.pool_geometry.envelope_rows
 
     if total:
         if positions_numel > scheduled_bs:
@@ -1463,6 +1614,8 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     md.reset_slots = set()
     md.state_slot_mapping_cpu = slot_arr
     md.state_slot_mapping = bufs.stage(bufs.state_slot, slot_arr, bs)
+    md.state_slot_in = md.state_slot_mapping
+    md.state_slot_out = md.state_slot_mapping
     md.batch_id_per_token_cpu = batch_np
     md.batch_id_per_token = bufs.stage(bufs.batch_id, batch_pad, t_pad)
     n_csa = (seq_np // 4).astype(np.int32)
@@ -1500,6 +1653,7 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
     hca_indptr = bufs.stage(bufs.indptr_hca, hca_indptr_np, t_pad + 1)
 
     positions_gpu = positions[:t_pad]
+    dest_rows = {ratio: buf.gpu for ratio, buf in bufs.swa_dest_rows.items()}
     write_v4_paged_decode_indices(
         state_slot_per_seq=md.state_slot_mapping,
         batch_id_per_token=md.batch_id_per_token,
@@ -1510,9 +1664,10 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
         swa_indices=bufs.idx_swa.gpu,
         csa_indices=bufs.idx_csa.gpu,
         hca_indices=bufs.idx_hca.gpu,
+        dest_rows=dest_rows,
         T=t_pad,
         win=win,
-        cache_size=int(md.swa_cs),
+        geometry=proxy_pool.pool_geometry,
     )
     write_v4_decode_hca_compress_tail(
         batch_id_per_token=md.batch_id_per_token,
@@ -1523,8 +1678,9 @@ def build_atom_v4_decode_graph_metadata_from_sglang(
         hca_indices=bufs.idx_hca.gpu,
         T=t_pad,
         win=win,
-        swa_pages=int(md.swa_pages),
+        envelope_rows=proxy_pool.pool_geometry.envelope_rows,
     )
+    md.swa_dest_rows = dest_rows
     md.kv_indices_swa = bufs.idx_swa.gpu
     md.kv_indices_csa = bufs.idx_csa.gpu
     md.kv_indices_hca = bufs.idx_hca.gpu
@@ -1571,6 +1727,27 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
 ):
     from atom.model_ops.v4_kernels import write_v4_paged_prefill_indices
     from atom.utils.forward_context import AttentionMetaData, AttnState
+
+    # DSpark draft pool is DENSE-only (ratio [0]): its dspark_attention reads its
+    # own rolling SWA window and builds its own gather buffers, so it never
+    # consumes the CSA/HCA/indexer indices this builder produces. The full V4
+    # index kernel asserts CSA+HCA are present, so short-circuit to the DENSE-only
+    # forward-path builder (which the draft forward already uses) for graph
+    # capture — the metadata is structurally valid and the draft ignores it.
+    try:
+        from atom.model_ops.attentions.v4_pool_geometry import CSA_RATIO, HCA_RATIO
+        from atom.model_ops.v4_kernels.pool_index import served_window_params
+
+        _served = served_window_params(proxy_pool.pool_geometry)
+        _dense_only = not (CSA_RATIO in _served and HCA_RATIO in _served)
+    except Exception:  # noqa: BLE001 - detection best-effort; fall through to full path
+        _dense_only = False
+    if _dense_only:
+        from atom.plugin.sglang.runtime.forward_context import (
+            _build_deepseek_v4_dspark_draft_metadata,
+        )
+
+        return _build_deepseek_v4_dspark_draft_metadata(forward_batch, positions)
 
     index_topk = _resolve_v4_index_topk(model=model, proxy_pool=proxy_pool)
     device = positions.device
@@ -1671,6 +1848,9 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     md.swa_cs = proxy_pool.swa_cache_size
     md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
+    md.pool_geometry = proxy_pool.pool_geometry
+    md.envelope_rows = proxy_pool.pool_geometry.envelope_rows
+    md.swa_dest_rows = None  # only populated in graph decode path
     # Target verify is extend-shaped for attention/compressor state, but the
     # indexer needs the fixed-shape decode scorer to be graph-safe.
     md.use_decode_indexer_for_verify_graph = True
@@ -1718,6 +1898,8 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     md.reset_slots = set()
     md.state_slot_mapping_cpu = slot_arr
     md.state_slot_mapping = bufs.state_slot.gpu[:bs]
+    md.state_slot_in = md.state_slot_mapping
+    md.state_slot_out = md.state_slot_mapping
     md.batch_id_per_token_cpu = batch_np
     md.batch_id_per_token = bufs.stage(bufs.batch_id, batch_np, total)
 
@@ -1736,7 +1918,6 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
     )
 
     win = int(md.swa_window)
-    cs = int(md.swa_cs)
     chunk_start_per_seq = pos_np[q_np[:-1]]
     chunk_start_pt = chunk_start_per_seq[batch_np]
     token_pos_in_chunk = pos_np - chunk_start_pt
@@ -1781,8 +1962,7 @@ def build_atom_v4_verify_graph_metadata_from_sglang(
         prefix_hca_indices=bufs.idx_prefix_hca.gpu,
         T=total,
         win=win,
-        cache_size=cs,
-        swa_pages=int(md.swa_pages),
+        geometry=proxy_pool.pool_geometry,
     )
     md.kv_indices_extend = bufs.idx_extend.gpu
     md.kv_indices_prefix_swa = bufs.idx_prefix_swa.gpu
@@ -1921,6 +2101,9 @@ def build_atom_v4_attention_metadata_from_sglang(
     md.swa_cs = proxy_pool.swa_cache_size
     md.index_topk = index_topk
     md.swa_pages = proxy_pool.num_slots * proxy_pool.swa_cache_size
+    md.pool_geometry = proxy_pool.pool_geometry
+    md.envelope_rows = proxy_pool.pool_geometry.envelope_rows
+    md.swa_dest_rows = None  # only populated in graph decode path
 
     if is_draft_extend:
         slot_arr = np.full(num_reqs, -1, dtype=np.int32)
@@ -1947,6 +2130,8 @@ def build_atom_v4_attention_metadata_from_sglang(
         md.state_slot_mapping = torch.from_numpy(slot_arr).to(
             device=device, dtype=torch.int32
         )
+    md.state_slot_in = md.state_slot_mapping
+    md.state_slot_out = md.state_slot_mapping
     md.batch_id_per_token_cpu = batch_np
     md.batch_id_per_token = torch.from_numpy(batch_np).to(device=device)
     md.n_committed_csa_per_seq_cpu = (seq_np // 4).astype(np.int32)
@@ -1971,15 +2156,18 @@ def build_atom_v4_attention_metadata_from_sglang(
 
 def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
     from atom.model_ops.v4_kernels import write_v4_paged_decode_indices
+    from atom.plugin.vllm.deepseek_v4_ops import write_v4_decode_hca_compress_tail
 
     win = int(md.swa_window)
-    cs = int(md.swa_cs)
     batch_np = md.batch_id_per_token_cpu
     if len(batch_np) == 0:
         empty = torch.empty(0, dtype=torch.int32, device=device)
         zero = torch.zeros(1, dtype=torch.int32, device=device)
         md.kv_indices_swa = md.kv_indices_csa = md.kv_indices_hca = empty
         md.kv_indptr_swa = md.kv_indptr_csa = md.kv_indptr_hca = zero
+        md.swa_dest_rows = {ratio: empty for ratio in (0, 4, 128)}
+        md.n_committed_per_token = empty
+        md.block_tables_per_token = empty
         return
     swa_counts = np.minimum(pos_np + 1, win).astype(np.int32)
     csa_counts = np.minimum(
@@ -2009,6 +2197,8 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
     hca_indices = torch.empty(
         max(1, int(hca_indptr_np[-1])), dtype=torch.int32, device=device
     )
+    T = len(batch_np)
+    eager_dest_rows = {ratio: torch.empty(max(1, T), dtype=torch.int32, device=device) for ratio in (0, 4, 128)}
     write_v4_paged_decode_indices(
         state_slot_per_seq=md.state_slot_mapping,
         batch_id_per_token=md.batch_id_per_token,
@@ -2019,23 +2209,36 @@ def _populate_decode_indices(md, block_tables, pos_np, device) -> None:
         swa_indices=swa_indices,
         csa_indices=csa_indices,
         hca_indices=hca_indices,
-        T=len(batch_np),
+        dest_rows=eager_dest_rows,
+        T=T,
         win=win,
-        cache_size=cs,
+        geometry=md.pool_geometry,
     )
-    # Fill HCA compressed section on CPU for the first-cut eager bridge.
-    # `write_v4_paged_decode_indices` writes the SWA prefix at the TAIL of each
-    # per-token slice, so HCA compressed entries must occupy the HEAD starting
-    # at hca_indptr[t].  This mirrors native ATOM's _attach_v4_paged_decode_meta.
-    hca_cpu = hca_indices.detach().cpu().numpy()
-    for t, bid in enumerate(batch_np):
-        n_hca = int(hca_counts[t])
-        base = int(hca_indptr_np[t])
-        if n_hca:
-            hca_cpu[base : base + n_hca] = int(md.swa_pages) + block_tables[
-                int(bid), :n_hca
-            ].detach().cpu().numpy().astype(np.int32)
-    hca_indices.copy_(torch.from_numpy(hca_cpu).to(device=device))
+    write_v4_decode_hca_compress_tail(
+        batch_id_per_token=md.batch_id_per_token,
+        positions=positions_gpu,
+        hca_indptr=hca_indptr,
+        n_committed_hca_per_seq=md.n_committed_hca_per_seq,
+        block_tables=block_tables,
+        hca_indices=hca_indices,
+        T=T,
+        win=win,
+        envelope_rows=md.pool_geometry.envelope_rows,
+    )
+    # Store dest_rows in the metadata so _attn_core can use them for the
+    # fused SWA write inside qk_norm_rope_maybe_quant during decode.
+    md.swa_dest_rows = eager_dest_rows
+    # n_committed_per_token: per-token count of CSA entries visible to each
+    # query (min of causal cap and committed CSA count). Used by the indexer.
+    visible_np = np.minimum(
+        (pos_np + 1) // 4, md.n_committed_csa_per_seq_cpu[batch_np]
+    ).astype(np.int32)
+    md.n_committed_per_token = torch.from_numpy(visible_np).to(device=device)
+    # block_tables_per_token: per-token block table rows. The indexer needs
+    # block_tables indexed by token (not by sequence).
+    md.block_tables_per_token = block_tables[
+        torch.from_numpy(batch_np.astype(np.int64)).to(device=device)
+    ]
     md.kv_indices_swa = swa_indices[: int(swa_indptr_np[-1])]
     md.kv_indices_csa = csa_indices[: int(csa_indptr_np[-1])]
     md.kv_indices_hca = hca_indices[: int(hca_indptr_np[-1])]
@@ -2065,7 +2268,6 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
         md.skip_prefix_len_csa = empty
         return
     win = int(md.swa_window)
-    cs = int(md.swa_cs)
     chunk_start_per_seq = pos_np[q_np[:-1]]
     chunk_start_pt = chunk_start_per_seq[batch_np]
     token_pos_in_chunk = pos_np - chunk_start_pt
@@ -2122,8 +2324,7 @@ def _populate_prefill_indices(md, block_tables, batch_np, pos_np, q_np, device) 
         prefix_hca_indices=hca_indices,
         T=T,
         win=win,
-        cache_size=cs,
-        swa_pages=int(md.swa_pages),
+        geometry=md.pool_geometry,
     )
     md.kv_indices_extend = ext_indices[: int(ext_indptr_np[-1])]
     md.kv_indices_prefix_swa = swa_indices[: int(swa_indptr_np[-1])]

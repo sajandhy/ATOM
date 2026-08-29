@@ -235,6 +235,26 @@ class _AtomCausalLMBaseForSglang(nn.Module):
 
         return {key: value for key, value in kwargs.items() if key in params}
 
+    @property
+    def lm_head(self):
+        """Expose lm_head for DSpark's DSparkWorkerV2 target model lookup.
+
+        SGLang's DSparkWorkerV2 calls ``target_model.lm_head.weight`` to share
+        the target's vocabulary projection with the draft model.  ATOM's V4
+        target uses ``model.model.head`` instead of a standard ``lm_head``.
+        """
+        if self.model_arch == "DeepseekV4ForCausalLM":
+            return getattr(getattr(self.model, "model", None), "head", None)
+        _, head_owner = self._embed_and_head_owners()
+        return getattr(head_owner, "lm_head", None)
+
+    def get_input_embeddings(self):
+        """Expose embedding lookup for DSparkWorkerV2._resolve_target_embed_tokens."""
+        if self.model_arch == "DeepseekV4ForCausalLM":
+            return getattr(getattr(self.model, "model", None), "embed", None)
+        embed_owner, _ = self._embed_and_head_owners()
+        return getattr(embed_owner, "embed_tokens", None)
+
     def get_embed_and_head(self):
         if hasattr(self.model, "get_embed_and_head"):
             return self.model.get_embed_and_head()
@@ -298,6 +318,130 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         torch.cuda.empty_cache()
         torch.cuda.synchronize()
 
+    def set_dspark_layers_to_capture(self, layer_ids: Iterable[int] | None = None):
+        """Configure target model to capture DSpark target-layer hidden states.
+
+        SGLang's DSparkWorkerV2 calls this on the target model so subsequent
+        forwards emit aux_hidden_states from the DSpark target layers (e.g.
+        layers [40, 41, 42] for V4-Flash-0731).  The hidden states are then
+        passed to TargetHiddenKvInjector.inject_target_hidden, which calls our
+        draft wrapper's write_target_hidden_kv.
+
+        ATOM's DeepseekV4Model.forward is @support_torch_compile and must not
+        be modified.  Instead we install forward hooks on the target layers —
+        hooks run outside the compiled boundary, so they are graph-safe.
+        """
+        if layer_ids is None:
+            hf_config = getattr(getattr(self, "atom_config", None), "hf_config", None)
+            layer_ids = list(
+                getattr(hf_config, "dspark_target_layer_ids", [])
+            )
+        layer_ids = tuple(int(i) for i in layer_ids)
+        if not layer_ids:
+            raise ValueError("set_dspark_layers_to_capture: no layer_ids provided")
+
+        self.capture_aux_hidden_states = True
+
+        # V4 target: layers live in self.model.model.layers (DeepseekV4Model).
+        v4_layers = None
+        if self.model_arch == "DeepseekV4ForCausalLM":
+            v4_model = getattr(self.model, "model", None)
+            v4_layers = getattr(v4_model, "layers", None)
+        if v4_layers is None:
+            raise AttributeError(
+                f"set_dspark_layers_to_capture: cannot find V4 layers on "
+                f"{type(self.model).__name__}"
+            )
+
+        # State container for hook-captured hidden states.
+        self._dspark_captured_hiddens: list[torch.Tensor] = []
+        self._dspark_capture_layer_ids = layer_ids
+        self._dspark_hook_handles: list = []
+
+        # Clear any previously registered hooks.
+        for h in getattr(self, "_dspark_hook_handles", []):
+            h.remove()
+        self._dspark_hook_handles = []
+
+        def make_hook(captured_list: list):
+            def hook(module, inputs, output):
+                # DeepseekV4Block forward returns an HCState carrying the
+                # multi-hidden-connection residual [T, hc, dim]. The DSpark aux
+                # tensor the draft was trained on is the hc_post reduction meaned
+                # over the hc axis — EXACTLY what ATOM's native proposer computes
+                # in DSparkProposer.aux_for (dspark_proposer.py:424-435). Taking
+                # x_prev[:, 0, :] (first hc slot, no hc_post) feeds the draft a
+                # silently-wrong context → garbage draft KV → ~0 accept rate.
+                hc_state = output
+                residual = getattr(hc_state, "residual", None)
+                if residual is not None:
+                    x_prev = getattr(hc_state, "x_prev", None)
+                    post = getattr(hc_state, "post_mix", None)
+                    comb = getattr(hc_state, "comb_mix", None)
+                    if x_prev is not None and post is not None and comb is not None:
+                        residual = module.hc_post(x_prev, residual, post, comb)
+                    captured_list.append(residual.mean(dim=1).detach())
+                    return
+                # Fallback: plain tensor output (non-mHC layers).
+                x = getattr(hc_state, "x_prev", None)
+                if x is None:
+                    x = output if torch.is_tensor(output) else None
+                if x is not None:
+                    if x.dim() == 3:
+                        x = x.mean(dim=1)
+                    captured_list.append(x.detach())
+            return hook
+
+        for lid in layer_ids:
+            if lid >= len(v4_layers):
+                raise ValueError(
+                    f"DSpark target layer_id={lid} >= num_layers={len(v4_layers)}"
+                )
+            h = v4_layers[lid].register_forward_hook(
+                make_hook(self._dspark_captured_hiddens)
+            )
+            self._dspark_hook_handles.append(h)
+
+        logger.info(
+            "DSpark target-layer capture configured for layers %s on %s",
+            layer_ids,
+            type(self.model).__name__,
+        )
+
+        # Wrap forward to emit (main_hidden, stacked_aux_hidden) when hooks fire.
+        # We concatenate all per-layer hidden states along dim=1 into a
+        # [T, num_layers * hidden_size] tensor so the entire block travels as a
+        # single tensor through SGLang's logits_output.hidden_states and the kv
+        # injector hands it to write_target_hidden_kv, which slices by dim.
+        num_target_layers = len(layer_ids)
+        _orig_model_forward = self.model.forward
+
+        # Build an allowed-param set from the original forward signature so the
+        # wrapper stays transparent to _filter_model_forward_kwargs.
+        import inspect as _inspect
+
+        _orig_sig_params = set(_inspect.signature(_orig_model_forward).parameters)
+
+        def _dspark_capturing_forward(*args, **kwargs):
+            # Drop kwargs the original forward doesn't accept (same filtering
+            # as _filter_model_forward_kwargs, but applied at call time because
+            # _filter_model_forward_kwargs now sees *args/**kwargs and passes all).
+            filtered_kwargs = {k: v for k, v in kwargs.items() if k in _orig_sig_params}
+            self._dspark_captured_hiddens.clear()
+            result = _orig_model_forward(*args, **filtered_kwargs)
+            captured = self._dspark_captured_hiddens
+            if captured and len(captured) == num_target_layers:
+                stacked = torch.cat(captured, dim=-1)
+                # ATOM's inner model already ran logits_processor internally.
+                # Attach the stacked aux hidden directly to its LogitsProcessorOutput
+                # so base_model_wrapper.forward can read it via _split_aux_hidden_states.
+                # base_model_wrapper.forward then sets output.hidden_states = stacked
+                # and returns the LogitsProcessorOutput directly (no double processing).
+                return result, stacked
+            return result
+
+        self.model.forward = _dspark_capturing_forward
+
     def set_eagle3_layers_to_capture(self, layer_ids: Iterable[int] | None = None):
         self.capture_aux_hidden_states = True
         if layer_ids is None:
@@ -322,12 +466,18 @@ class _AtomCausalLMBaseForSglang(nn.Module):
         )
 
     def _split_aux_hidden_states(self, output):
-        if (
-            isinstance(output, tuple)
-            and len(output) == 2
-            and (torch.is_tensor(output[0]) or hasattr(output[0], "tensors"))
-        ):
-            return output[0], output[1]
+        if isinstance(output, tuple) and len(output) == 2:
+            first = output[0]
+            # Accept: raw tensor, IntermediateTensors (.tensors), or
+            # LogitsProcessorOutput (.hidden_states) — the DSpark capturing
+            # forward wraps the already-processed logits output with the
+            # stacked aux hidden states as the second element.
+            if (
+                torch.is_tensor(first)
+                or hasattr(first, "tensors")
+                or hasattr(first, "hidden_states")
+            ):
+                return output[0], output[1]
         return output, None
 
     def _trim_aux_hidden_states(self, runtime, aux_hidden_states):
@@ -416,7 +566,10 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                             )
                     elif self.model_arch_spec.uses_context_only_forward:
                         tbo_output = None
-                        if self.atom_config.enable_tbo:
+                        # TBO bypasses self.model() and skips forward hooks, so DSpark
+                        # aux-hidden capture never fires on the TBO path. Fall through
+                        # to the standard self.model() call when capture is active.
+                        if self.atom_config.enable_tbo and not self.capture_aux_hidden_states:
                             tbo_output = self._try_forward_with_atom_tbo(
                                 runtime=runtime,
                                 metadata=metadata,
@@ -473,6 +626,19 @@ class _AtomCausalLMBaseForSglang(nn.Module):
 
                 if self.pp_group.is_last_rank:
                     if self.model_arch == "DeepseekV4ForCausalLM":
+                        # When DSpark capture is active, aux_hidden_states holds the
+                        # stacked target-layer hidden. Under CaptureHiddenMode.FULL,
+                        # LogitsProcessor stores pack_aux_hidden_states(aux) — but only
+                        # if hidden_states_before_norm is NOT passed, since that value
+                        # overrides the stored hidden. So omit it when aux is present.
+                        if aux_hidden_states is not None:
+                            return self.logits_processor(
+                                logits_input_ids,
+                                hidden_states,
+                                self.logits_head,
+                                forward_batch,
+                                aux_hidden_states=aux_hidden_states,
+                            )
                         return self.logits_processor(
                             logits_input_ids,
                             hidden_states,

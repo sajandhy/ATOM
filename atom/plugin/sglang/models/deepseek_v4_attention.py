@@ -245,6 +245,58 @@ def _install_draft_extend_fused_swa_patch() -> None:
     dsv4._atom_sglang_draft_extend_fused_swa_patched = True
 
 
+def _install_v4_attention_with_output_patch() -> None:
+    """Break the SGLang wrapper → v4_attention_with_output → wrapper cycle.
+
+    patch_deepseek_v4_attention_for_sglang replaces attn.forward_impl with a
+    wrapper that calls attn._sglang_v4_forward_impl (the original). The original
+    calls torch.ops.aiter.v4_attention_with_output → static_forward_context →
+    self.forward_impl (the wrapper) → _sglang_v4_forward_impl → ... infinite loop.
+
+    Fix: update static_forward_context[layer_name] so that its forward_impl
+    attribute points to the original implementation, not the SGLang wrapper.
+    We use a thin proxy that routes forward_impl back to _sglang_v4_forward_impl.
+    """
+    pass  # Applied per-layer in patch_deepseek_v4_attention_for_sglang
+
+
+def _update_static_forward_context_for_sglang(attn: nn.Module) -> None:
+    """Replace the static_forward_context entry to break the infinite-recursion cycle.
+
+    torch.ops.aiter.v4_attention_with_output dispatches to
+    static_forward_context[layer_name].forward_impl. After patching attn.forward_impl
+    to the SGLang wrapper, that dispatch would re-enter the wrapper (infinite loop).
+    Instead, store a proxy whose forward_impl calls _sglang_v4_forward_impl directly.
+    """
+    from atom.config import get_current_atom_config
+
+    layer_name = getattr(attn, "layer_name", None)
+    if layer_name is None:
+        return
+
+    try:
+        atom_config = get_current_atom_config()
+        ctx = atom_config.compilation_config.static_forward_context
+    except Exception:  # noqa: BLE001
+        return
+
+    if layer_name not in ctx:
+        return
+
+    original_impl = attn._sglang_v4_forward_impl
+
+    class _V4AttnProxy:
+        """Proxy that routes v4_attention_with_output to the pre-patch forward_impl."""
+
+        def forward_impl(self_proxy, x: torch.Tensor, positions: torch.Tensor):
+            return original_impl(x, positions)
+
+        def __getattr__(self_proxy, name: str):
+            return getattr(attn, name)
+
+    ctx[layer_name] = _V4AttnProxy()
+
+
 def patch_deepseek_v4_attention_for_sglang(attn: nn.Module) -> None:
     """Patch ATOM V4 attention for SGLang's padded prefill execution.
 
@@ -360,3 +412,15 @@ def patch_deepseek_v4_attention_for_sglang(attn: nn.Module) -> None:
         return call_original(x, positions)
 
     attn.forward_impl = types.MethodType(_forward_impl, attn)
+
+    # v4_attention_with_output dispatches to self.forward_impl via
+    # static_forward_context[layer_name]. After patching, self.forward_impl is
+    # the new wrapper — calling it from inside _sglang_v4_forward_impl (which
+    # calls v4_attention_with_output) creates an infinite cycle.
+    #
+    # Fix: replace the static_forward_context entry with a proxy whose
+    # forward_impl routes to _sglang_v4_forward_impl (the pre-patch original),
+    # so the op dispatcher sees the correct implementation without cycling.
+    _install_v4_attention_with_output_patch()
+    _update_static_forward_context_for_sglang(attn)
+

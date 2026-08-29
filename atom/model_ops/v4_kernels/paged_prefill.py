@@ -637,6 +637,28 @@ def sparse_attn_v4_paged_prefill(
         # and extend K fed directly. No dequant of the prefix, no torch quant.
         from aiter.ops.pa_sparse_prefill_opus import pa_sparse_prefill_fp8_opus
 
+        import os as _os
+        if _os.environ.get("ATOM_V4_VALIDATE_PREFILL_IDX"):
+            _tp = int(unified_kv.size(0))
+            _tt = int(k_packed.shape[0]) if k_packed is not None else -1
+            _T = int(q_packed.shape[0]) if q_packed is not None else -1
+            if kv_indices_prefix is not None and kv_indices_prefix.numel():
+                _pmax = int(kv_indices_prefix.max().item())
+                _pmin = int(kv_indices_prefix.min().item())
+                if _pmax >= _tp or _pmin < -1:
+                    print(f"[V4-IDX-OOB] prefix idx range [{_pmin},{_pmax}] vs "
+                          f"total_pages={_tp} T={_T} "
+                          f"indptr_prefix[-1]={int(kv_indptr_prefix[-1].item())}",
+                          flush=True)
+            if kv_indices_extend is not None and kv_indices_extend.numel() and _tt >= 0:
+                _emax = int(kv_indices_extend.max().item())
+                _emin = int(kv_indices_extend.min().item())
+                if _emax >= _tt or _emin < -1:
+                    print(f"[V4-IDX-OOB] extend idx range [{_emin},{_emax}] vs "
+                          f"total_tokens={_tt} T={_T} "
+                          f"indptr_extend[-1]={int(kv_indptr_extend[-1].item())}",
+                          flush=True)
+
         return pa_sparse_prefill_fp8_opus(
             q_packed,
             q_rope,

@@ -499,10 +499,21 @@ def _generate_atom_config_from_sglang_config(config: Any):
     # use sglang torch compile policy and cuda graph policy
     # because sglang doesn't use the compile decorator for model,
     # we have no method to define self policy
+    #
+    # cudagraph_mode=PIECEWISE: DeepSeek-V4 forward_impl checks
+    # `cg_mode is not None and cg_mode.requires_piecewise_compilation()` to
+    # decide whether to use the piecewise split ops (v4_core_attention) or the
+    # wide-split op (v4_attention_with_output). With cudagraph_mode=None, it
+    # always goes to v4_attention_with_output, which dispatches back to
+    # forward_impl — an infinite loop in SGLang plugin mode. Setting PIECEWISE
+    # routes through v4_core_attention instead, which runs eagerly when
+    # fc.cudagraph_runtime_mode is None (no graph is being captured/replayed).
+    from atom.config import CUDAGraphMode as _CUDAGraphMode
+
     sgl_compilation_config = CompilationConfig(
         level=0,
         use_cudagraph=False,
-        cudagraph_mode=None,
+        cudagraph_mode=_CUDAGraphMode.PIECEWISE,
     )
 
     sglang_dist_init_addr = server_args.dist_init_addr

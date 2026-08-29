@@ -331,7 +331,18 @@ def gemm_a8w8_blockscale_triton_impl(
     # Wrap the raw Triton launcher in a custom-op boundary so Dynamo treats it
     # as opaque (otherwise tracing into the Triton kernel launch causes a graph
     # break that splits the compiled model into >1 graph).
-    return gemm_a8w8_blockscale_triton(x, weight, x_scale, w_scale, dtype)
+    # DSpark backbone passes 3D tensors [B, T, dim]; flatten to 2D for Triton.
+    # x_scale has shape [B, T, dim//128] in the 3D case — flatten it too so the
+    # kernel sees [M, K//128] matching the flattened [M, K] activation.
+    leading_shape = x.shape[:-1]
+    if x.dim() > 2:
+        x = x.reshape(-1, x.shape[-1])
+        if x_scale is not None and x_scale.dim() > 2:
+            x_scale = x_scale.reshape(-1, x_scale.shape[-1])
+    y = gemm_a8w8_blockscale_triton(x, weight, x_scale, w_scale, dtype)
+    if len(leading_shape) > 1:
+        y = y.reshape(*leading_shape, y.shape[-1])
+    return y
 
 
 def gemm_a8w8_per_tensor_fake(
@@ -1078,6 +1089,14 @@ class LinearBase(nn.Module):
                         "path (ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE)."
                     )
                     if use_triton_gemm() and gemm_a8w8_blockscale_triton is not None:
+                        # DSpark passes 3D [B, T, dim] activations and [B, T, dim//128]
+                        # scales; flatten both to 2D before the custom-op boundary so
+                        # the Triton kernel sees [M, K] and [M, K//128].
+                        _leading = x.shape[:-1]
+                        if x.dim() > 2:
+                            x = x.reshape(-1, x.shape[-1])
+                            if x_scale is not None and x_scale.dim() > 2:
+                                x_scale = x_scale.reshape(-1, x_scale.shape[-1])
                         y = gemm_a8w8_blockscale_triton_impl(
                             x,
                             self.weight,
@@ -1085,6 +1104,8 @@ class LinearBase(nn.Module):
                             self.weight_scale,
                             dtype=otype,
                         )
+                        if len(_leading) > 1:
+                            y = y.reshape(*_leading, y.shape[-1])
                     else:
                         y = gemm_a8w8_blockscale(
                             x,

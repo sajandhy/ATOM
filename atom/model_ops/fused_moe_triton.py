@@ -35,8 +35,12 @@ if (
         moe_gemm_a8w4,
     )
     from aiter.ops.triton.moe.moe_op_gemm_a16w4 import (
-        moe_gemm_a16w4,
+        moe_gemm_a16w4 as _moe_gemm_a16w4,
     )
+    import functools as _functools
+    # Always use Triton backend — GLUON is only available on gfx1250.
+    # This suppresses the repeated "GLUON backend not available" warning.
+    moe_gemm_a16w4 = _functools.partial(_moe_gemm_a16w4, backend="triton")
     from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
         moe_gemm_a4w4,
         mxfp4_quant,

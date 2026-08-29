@@ -94,6 +94,17 @@ def _build_deepseek_v4_forward_metadata(
     return _build_deepseek_v4_metadata(forward_batch, positions)
 
 
+def _build_deepseek_v4_dspark_draft_forward_metadata(
+    atom_config: Any, forward_batch: Any, positions: Any
+) -> Any:
+    del atom_config
+    from atom.plugin.sglang.runtime.forward_context import (
+        _build_deepseek_v4_dspark_draft_metadata,
+    )
+
+    return _build_deepseek_v4_dspark_draft_metadata(forward_batch, positions)
+
+
 def _build_eagle3_llama_forward_metadata(
     atom_config: Any, forward_batch: Any, positions: Any
 ) -> Any:
@@ -467,6 +478,19 @@ MODEL_ADAPTER_SPECS = {
         install_adapters=_install_deepseek_v4_adapters,
         bind_cache_views=_bind_deepseek_v4_cache_views,
         build_forward_metadata=_build_deepseek_v4_forward_metadata,
+    ),
+    # DeepseekV4MTPModel and DeepseekV4DSparkModel are ATOM-renamed architectures
+    # for DeepSeek-V4 draft models (renamed by SpeculativeConfig.hf_config_override).
+    # Both run inside DeepseekV4ForCausalLMNextN which handles adapter installation
+    # and cache view binding itself, so only forward metadata building is registered.
+    "DeepseekV4MTPModel": SGLangModelAdapterSpec(
+        build_forward_metadata=_build_deepseek_v4_forward_metadata,
+    ),
+    # DeepseekV4DSparkModel is the DSpark draft model. It runs only 3 target
+    # layers (SWA writes only), so it does not need the full V4 metadata with
+    # CSA/HCA pool geometry. A lighter builder provides what DSpark needs.
+    "DeepseekV4DSparkModel": SGLangModelAdapterSpec(
+        build_forward_metadata=_build_deepseek_v4_dspark_draft_forward_metadata,
     ),
     "MiniMaxM3SparseForCausalLM": SGLangModelAdapterSpec(
         uses_context_only_forward=True,
